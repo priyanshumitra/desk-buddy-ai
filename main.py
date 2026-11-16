@@ -5,6 +5,7 @@ import wave
 import secrets
 import asyncio
 import logging
+import traceback
 from math import gcd
 
 import httpx
@@ -16,6 +17,10 @@ from fastapi.responses import Response
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Change this text whenever you edit the file.
+# Open /version in a browser to confirm Render runs this exact file.
+BUILD = "2026-11-16-v3"
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("desk-buddy")
@@ -54,7 +59,6 @@ Rules:
 # Short-term memory per device. Resets when the server restarts.
 conversations = {}
 
-# Convert typographic characters to plain ones so speech sounds clean.
 PUNCT_MAP = str.maketrans({
     "\u2018": "'", "\u2019": "'",
     "\u201c": '"', "\u201d": '"',
@@ -154,7 +158,6 @@ def clean_for_speech(text: str) -> str:
     if len(text) <= MAX_SPEECH_CHARS:
         return text
 
-    # Cut at the last full sentence when possible, otherwise at a word.
     cut = text[:MAX_SPEECH_CHARS]
     end = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
     if end > 40:
@@ -163,28 +166,10 @@ def clean_for_speech(text: str) -> str:
     return cut.rsplit(" ", 1)[0].rstrip(",;:") + "."
 
 
-async def synthesize(client: httpx.AsyncClient, text: str) -> bytes:
-    response = await groq_post(
-        client,
-        "audio/speech",
-        json={
-            "model": TTS_MODEL,
-            "input": text,
-            "voice": TTS_VOICE,
-            "response_format": "wav",
-        },
-    )
-    return to_device_wav(response.content)
-
-
 def to_device_wav(source_wav: bytes) -> bytes:
-    """Converts any WAV from the speech service to 16 kHz mono 16-bit."""
+    """Converts the speech service's WAV to 16 kHz mono 16-bit."""
     try:
-        audio, rate = sf.read(
-            io.BytesIO(source_wav),
-            dtype="float32",
-            always_2d=True
-        )
+        audio, rate = sf.read(io.BytesIO(source_wav), dtype="float32", always_2d=True)
     except Exception as exc:
         raise ProviderError(f"speech audio unreadable: {exc}")
 
@@ -208,6 +193,20 @@ def to_device_wav(source_wav: bytes) -> bytes:
         wav.writeframes(pcm.tobytes())
 
     return output.getvalue()
+
+
+async def synthesize(client: httpx.AsyncClient, text: str) -> bytes:
+    response = await groq_post(
+        client,
+        "audio/speech",
+        json={
+            "model": TTS_MODEL,
+            "input": text,
+            "voice": TTS_VOICE,
+            "response_format": "wav",
+        },
+    )
+    return to_device_wav(response.content)
 
 
 def build_messages(conv_key: str, transcript: str) -> list:
@@ -237,6 +236,11 @@ async def health():
     return {"status": "healthy"}
 
 
+@app.get("/version")
+async def version():
+    return {"build": BUILD}
+
+
 @app.post("/talk")
 async def talk(
     file: UploadFile = File(...),
@@ -245,12 +249,11 @@ async def talk(
 ):
     authenticate(x_device_token)
 
-    audio_data = await file.read()
-    validate_wav(audio_data)
-
-    conv_key = conversation_id[:64]
-
     try:
+        audio_data = await file.read()
+        validate_wav(audio_data)
+        conv_key = conversation_id[:64]
+
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(30.0, connect=10.0)
         ) as client:
@@ -276,11 +279,13 @@ async def talk(
             # 3. Text to speech
             wav = await synthesize(client, speech)
 
+    except HTTPException:
+        raise
     except ProviderError as exc:
-        log.error("Provider problem: %s", exc)
+        log.error("Provider step failed: %s", exc)
         raise HTTPException(status_code=503, detail="AI service temporarily unavailable")
     except Exception:
-        log.exception("Unexpected error while handling /talk")
+        log.error("Unexpected error:\n%s", traceback.format_exc())
         raise HTTPException(status_code=503, detail="Internal error, please try again")
 
     return Response(
